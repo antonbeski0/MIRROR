@@ -1,19 +1,43 @@
 import streamlit as st
 try:
     import cv2
+    CV2_AVAILABLE = True
 except ImportError:
-    st.error("OpenCV is not installed. Please install it with: pip install opencv-python-headless")
+    CV2_AVAILABLE = False
+    st.error("""
+    **OpenCV is not installed.** 
+    
+    Please install it with one of these commands:
+    - `pip install opencv-python-headless`
+    - `pip install opencv-python`
+    
+    Or if you're using conda:
+    - `conda install opencv`
+    """)
     st.stop()
+
 import numpy as np
 from PIL import Image
 import pandas as pd
 from scipy import signal
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.express as px
 from datetime import datetime, timedelta
 import warnings
+import io
+import json
 warnings.filterwarnings('ignore')
+
+# Try to import SHAP for explainability
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
 
 # Page configuration
 st.set_page_config(page_title="Military-Grade Candlestick Predictor", layout="wide", page_icon="📊")
@@ -170,10 +194,39 @@ class AdvancedPredictor:
     """Military-grade prediction engine with multiple algorithms"""
     
     def __init__(self):
+        self.model_version = "v1.3.2"
+        self.training_date = datetime.now().strftime("%Y-%m-%d")
         self.models = {
-            'gbr': GradientBoostingRegressor(n_estimators=100, max_depth=5, learning_rate=0.1),
+            'gbr': GradientBoostingRegressor(n_estimators=100, max_depth=5, learning_rate=0.1, random_state=42),
         }
         self.scaler = StandardScaler()
+        self.performance_metrics = {}
+        self.feature_names = []
+        
+    def get_model_info(self):
+        """Return model metadata for display"""
+        gbr = self.models['gbr']
+        return {
+            'name': 'GradientBoostingRegressor',
+            'version': self.model_version,
+            'training_date': self.training_date,
+            'hyperparameters': {
+                'n_estimators': gbr.n_estimators,
+                'max_depth': gbr.max_depth,
+                'learning_rate': gbr.learning_rate
+            },
+            'scaler': 'StandardScaler',
+            'feature_count': len(self.feature_names) if self.feature_names else 0
+        }
+    
+    def get_feature_importance(self):
+        """Get top feature importances"""
+        if hasattr(self.models['gbr'], 'feature_importances_'):
+            importances = self.models['gbr'].feature_importances_
+            indices = np.argsort(importances)[::-1][:20]
+            top_features = [(self.feature_names[i], importances[i]) for i in indices if i < len(self.feature_names)]
+            return top_features
+        return []
         
     def calculate_features(self, df):
         """Extract 50+ advanced technical features"""
@@ -227,7 +280,7 @@ class AdvancedPredictor:
         features['roc_10'] = df['close'].pct_change(10)
         
         features = features.replace([np.inf, -np.inf], 0)
-        return features.fillna(method='bfill').fillna(0)
+        return features.bfill().fillna(0)
     
     def _calculate_rsi(self, prices, period=14):
         """Calculate RSI"""
@@ -266,6 +319,9 @@ class AdvancedPredictor:
         if len(X) < 20:
             st.warning("Insufficient data for prediction. Need at least 20 candles.")
             return None
+        
+        # Store feature names for explainability
+        self.feature_names = list(features.columns)
         
         # Scale features
         X_scaled = self.scaler.fit_transform(X)
@@ -375,6 +431,164 @@ def create_overlay_image(img: np.ndarray, candlesticks: list, analysis_text: lis
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     return rgb
 
+# ========== COMPREHENSIVE METRICS & VISUALIZATIONS ==========
+
+class PerformanceMetrics:
+    """Calculate comprehensive performance metrics"""
+    
+    @staticmethod
+    def calculate_metrics(actual, predicted):
+        """Calculate all performance metrics"""
+        if len(actual) == 0 or len(predicted) == 0:
+            return {}
+        
+        # Convert to arrays
+        actual = np.array(actual)
+        predicted = np.array(predicted)
+        
+        # Remove any invalid values
+        mask = np.isfinite(actual) & np.isfinite(predicted)
+        actual = actual[mask]
+        predicted = predicted[mask]
+        
+        if len(actual) == 0:
+            return {}
+        
+        errors = actual - predicted
+        
+        # Basic metrics
+        mae = np.mean(np.abs(errors))
+        rmse = np.sqrt(np.mean(errors**2))
+        mape = np.mean(np.abs(errors / (actual + 1e-10))) * 100
+        
+        # Calculate R²
+        ss_res = np.sum((actual - predicted)**2)
+        ss_tot = np.sum((actual - np.mean(actual))**2)
+        r2 = 1 - (ss_res / (ss_tot + 1e-10))
+        
+        # Directional accuracy
+        if len(actual) > 1 and len(predicted) > 1:
+            actual_dir = np.diff(actual) > 0
+            predicted_dir = np.diff(predicted) > 0
+            directional_acc = np.mean(actual_dir == predicted_dir) * 100
+        else:
+            directional_acc = 0
+        
+        # Residual statistics
+        residual_mean = np.mean(errors)
+        residual_std = np.std(errors)
+        
+        return {
+            'mae': float(mae),
+            'rmse': float(rmse),
+            'mape': float(mape),
+            'r2': float(r2),
+            'directional_accuracy': float(directional_acc),
+            'residual_mean': float(residual_mean),
+            'residual_std': float(residual_std)
+        }
+    
+    @staticmethod
+    def calculate_rolling_metrics(actual, predicted, window=20):
+        """Calculate rolling metrics over time"""
+        n = min(len(actual), len(predicted))
+        if n == 0:
+            return pd.DataFrame()
+        
+        rolling_mae = []
+        rolling_rmse = []
+        
+        for i in range(window, n):
+            window_actual = actual[i-window:i]
+            window_pred = predicted[i-window:i]
+            
+            mae = np.mean(np.abs(window_actual - window_pred))
+            rmse = np.sqrt(np.mean((window_actual - window_pred)**2))
+            
+            rolling_mae.append(mae)
+            rolling_rmse.append(rmse)
+        
+        return pd.DataFrame({
+            'rolling_mae': rolling_mae,
+            'rolling_rmse': rolling_rmse
+        })
+
+def run_backtest(df, predictions, initial_capital=10000):
+    """Run a simple backtest simulation"""
+    if len(predictions) == 0:
+        return {}
+    
+    pred_df = pd.DataFrame(predictions)
+    
+    # Simple strategy: predict direction and trade
+    equity = []
+    cash = initial_capital
+    position = 0  # 0: no position, 1: long, -1: short
+    
+    equity.append(cash)
+    
+    # For each prediction, simulate a trade
+    for i in range(len(pred_df)):
+        pred = pred_df.iloc[i]
+        
+        # Determine signal (simplified)
+        if pred['close'] > df['close'].iloc[-1] if i == 0 else pred_df.iloc[i-1]['close']:
+            signal = 1  # Buy
+        else:
+            signal = -1  # Sell/Short
+        
+        # Simulate trade (simple version)
+        trade_size = cash * 0.1  # Use 10% of capital per trade
+        
+        if signal == 1:  # Long
+            if position <= 0:  # Close previous position if any
+                cash += position * trade_size if position < 0 else 0
+            position = trade_size / pred['close'] if pred['close'] > 0 else 0
+        else:  # Short
+            if position >= 0:
+                cash += position * trade_size if position > 0 else 0
+            position = -trade_size / pred['close'] if pred['close'] > 0 else 0
+        
+        # Update equity
+        current_value = cash + (position * pred['close'])
+        equity.append(current_value)
+    
+    equity = np.array(equity)
+    returns = np.diff(equity) / equity[:-1]
+    
+    # Calculate metrics
+    total_return = (equity[-1] - equity[0]) / equity[0] * 100
+    sharpe = np.mean(returns) / (np.std(returns) + 1e-10) * np.sqrt(252)
+    
+    # Calculate drawdown
+    cumulative = np.cumprod(1 + returns)
+    running_max = np.maximum.accumulate(cumulative)
+    drawdown = (cumulative - running_max) / running_max
+    
+    max_drawdown = np.min(drawdown) * 100
+    
+    # Winning trades
+    winning_trades = np.sum(returns > 0)
+    total_trades = len(returns)
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+    
+    avg_win = np.mean(returns[returns > 0]) if np.any(returns > 0) else 0
+    avg_loss = np.mean(returns[returns < 0]) if np.any(returns < 0) else 0
+    
+    return {
+        'equity_curve': equity,
+        'returns': returns,
+        'cumulative_returns': cumulative,
+        'drawdown': drawdown,
+        'total_return_pct': float(total_return),
+        'sharpe_ratio': float(sharpe),
+        'max_drawdown_pct': float(max_drawdown),
+        'win_rate': float(win_rate),
+        'total_trades': int(total_trades),
+        'avg_win': float(avg_win),
+        'avg_loss': float(avg_loss)
+    }
+
 def plot_predictions(df, predictions):
     """Create interactive Plotly chart with predictions"""
     fig = go.Figure()
@@ -423,6 +637,238 @@ def plot_predictions(df, predictions):
     
     return fig
 
+def plot_prediction_vs_actual(df, predictions):
+    """Plot predicted vs actual scatter"""
+    if not predictions:
+        return None
+    
+    pred_df = pd.DataFrame(predictions)
+    
+    # For visualization, use recent historical data
+    recent_actual = df['close'].tail(len(pred_df)).values
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=recent_actual,
+        y=pred_df['close'].values,
+        mode='markers',
+        marker=dict(color='cyan', size=8, opacity=0.7),
+        name='Predictions'
+    ))
+    
+    # Add diagonal line
+    min_val = min(recent_actual.min(), pred_df['close'].min())
+    max_val = max(recent_actual.max(), pred_df['close'].max())
+    fig.add_trace(go.Scatter(
+        x=[min_val, max_val],
+        y=[min_val, max_val],
+        mode='lines',
+        line=dict(color='red', dash='dash'),
+        name='Perfect Prediction'
+    ))
+    
+    fig.update_layout(
+        title='Predicted vs Actual (Recent Comparison)',
+        xaxis_title='Actual Close Price',
+        yaxis_title='Predicted Close Price',
+        template='plotly_dark',
+        height=400
+    )
+    return fig
+
+def plot_residuals(df, predictions):
+    """Plot residual analysis"""
+    if not predictions:
+        return None
+    
+    pred_df = pd.DataFrame(predictions)
+    recent_actual = df['close'].tail(len(pred_df)).values
+    residuals = recent_actual - pred_df['close'].values
+    
+    fig = make_subplots(rows=2, cols=2, 
+                        subplot_titles=('Residuals Over Time', 'Residual Distribution', 
+                                       'QQ Plot', 'Residual vs Predicted'),
+                        specs=[[{"secondary_y": False}, {"secondary_y": False}],
+                               [{"secondary_y": False}, {"secondary_y": False}]])
+    
+    # Residuals over time
+    fig.add_trace(go.Scatter(x=list(range(len(residuals))), y=residuals,
+                            mode='lines+markers', name='Residuals', line=dict(color='cyan')),
+                 row=1, col=1)
+    fig.add_hline(y=0, line_dash='dash', line_color='red', row=1, col=1)
+    
+    # Histogram
+    fig.add_trace(go.Histogram(x=residuals, nbinsx=20, name='Distribution'),
+                 row=1, col=2)
+    
+    # Scatter residual vs predicted
+    fig.add_trace(go.Scatter(x=pred_df['close'], y=residuals,
+                            mode='markers', name='Residuals'),
+                 row=2, col=2)
+    fig.add_hline(y=0, line_dash='dash', line_color='red', row=2, col=2)
+    
+    fig.update_layout(template='plotly_dark', height=600, showlegend=False)
+    fig.update_xaxes(title_text="Candle Index", row=1, col=1)
+    fig.update_yaxes(title_text="Error", row=1, col=1)
+    fig.update_xaxes(title_text="Residual Value", row=1, col=2)
+    fig.update_xaxes(title_text="Predicted Value", row=2, col=2)
+    fig.update_yaxes(title_text="Error", row=2, col=2)
+    
+    return fig
+
+def plot_feature_importance(predictor):
+    """Plot feature importance"""
+    importances = predictor.get_feature_importance()
+    if not importances:
+        return None
+    
+    features, values = zip(*importances)
+    
+    fig = go.Figure(data=go.Bar(
+        x=values,
+        y=features,
+        orientation='h',
+        marker=dict(color='cyan')
+    ))
+    
+    fig.update_layout(
+        title='Top 20 Feature Importance',
+        xaxis_title='Importance',
+        yaxis_title='Feature',
+        template='plotly_dark',
+        height=600
+    )
+    return fig
+
+def plot_backtest_results(backtest_results):
+    """Plot backtest equity curve and drawdown"""
+    if not backtest_results or 'equity_curve' not in backtest_results:
+        return None
+    
+    fig = make_subplots(rows=2, cols=1, 
+                        subplot_titles=('Equity Curve', 'Drawdown'),
+                        vertical_spacing=0.1)
+    
+    equity = backtest_results['equity_curve']
+    drawdown = backtest_results['drawdown']
+    
+    fig.add_trace(go.Scatter(
+        y=equity,
+        mode='lines',
+        name='Equity',
+        line=dict(color='green', width=2)
+    ), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(
+        y=drawdown,
+        mode='lines',
+        name='Drawdown',
+        fill='tonexty',
+        line=dict(color='red', width=2)
+    ), row=2, col=1)
+    
+    fig.update_layout(template='plotly_dark', height=600, showlegend=False)
+    fig.update_xaxes(title_text="Period", row=2, col=1)
+    fig.update_yaxes(title_text="Value", row=1, col=1)
+    fig.update_yaxes(title_text="Drawdown %", row=2, col=1)
+    
+    return fig
+
+def plot_rolling_metrics(rolling_metrics_df):
+    """Plot rolling error metrics"""
+    if rolling_metrics_df.empty:
+        return None
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        y=rolling_metrics_df['rolling_mae'],
+        mode='lines',
+        name='Rolling MAE',
+        line=dict(color='cyan')
+    ))
+    fig.add_trace(go.Scatter(
+        y=rolling_metrics_df['rolling_rmse'],
+        mode='lines',
+        name='Rolling RMSE',
+        line=dict(color='orange')
+    ))
+    
+    fig.update_layout(
+        title='Rolling Error Metrics Over Time',
+        xaxis_title='Period',
+        yaxis_title='Error',
+        template='plotly_dark',
+        height=400
+    )
+    return fig
+
+def plot_correlation_heatmap(df):
+    """Plot correlation heatmap of price features"""
+    # Select numeric columns
+    numeric_df = df[['open', 'high', 'low', 'close', 'volume']]
+    corr = numeric_df.corr()
+    
+    fig = go.Figure(data=go.Heatmap(
+        z=corr.values,
+        x=corr.columns,
+        y=corr.index,
+        colorscale='Viridis',
+        text=corr.values.round(2),
+        texttemplate="%{text}",
+        textfont={"size":10}
+    ))
+    
+    fig.update_layout(
+        title='Price Feature Correlation Matrix',
+        template='plotly_dark',
+        height=400
+    )
+    return fig
+
+def export_predictions_csv(predictions):
+    """Export predictions to CSV"""
+    df = pd.DataFrame(predictions)
+    return df.to_csv(index=False).encode('utf-8')
+
+def export_predictions_json(predictions):
+    """Export predictions to JSON"""
+    return json.dumps(predictions, indent=2, default=str).encode('utf-8')
+
+def export_model_report(predictor, metrics, backtest_results):
+    """Export comprehensive model report"""
+    model_info = predictor.get_model_info()
+    
+    report = f"""
+# Model Performance Report
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## Model Information
+- **Model Name**: {model_info['name']}
+- **Version**: {model_info['version']}
+- **Training Date**: {model_info['training_date']}
+- **Feature Count**: {model_info['feature_count']}
+
+## Hyperparameters
+- **N Estimators**: {model_info['hyperparameters']['n_estimators']}
+- **Max Depth**: {model_info['hyperparameters']['max_depth']}
+- **Learning Rate**: {model_info['hyperparameters']['learning_rate']}
+
+## Performance Metrics
+- **MAE**: {metrics.get('mae', 'N/A'):.4f}
+- **RMSE**: {metrics.get('rmse', 'N/A'):.4f}
+- **MAPE**: {metrics.get('mape', 'N/A'):.2f}%
+- **R² Score**: {metrics.get('r2', 'N/A'):.4f}
+- **Directional Accuracy**: {metrics.get('directional_accuracy', 'N/A'):.2f}%
+
+## Backtest Results
+- **Total Return**: {backtest_results.get('total_return_pct', 'N/A'):.2f}%
+- **Sharpe Ratio**: {backtest_results.get('sharpe_ratio', 'N/A'):.2f}
+- **Max Drawdown**: {backtest_results.get('max_drawdown_pct', 'N/A'):.2f}%
+- **Win Rate**: {backtest_results.get('win_rate', 'N/A'):.2f}%
+- **Total Trades**: {backtest_results.get('total_trades', 'N/A')}
+"""
+    return report.encode('utf-8')
+
 # Streamlit UI
 st.title("🎯 Military-Grade Candlestick Predictor")
 st.markdown("**Ultra-Low Latency AI-Powered Next Candle Prediction**")
@@ -445,8 +891,6 @@ if uploaded_file:
     # Load and display image
     image = Image.open(uploaded_file)
     img_array = np.array(image)
-    
-    st.image(image, caption="Uploaded Chart", use_container_width=True)
     
     with st.spinner("🔍 Analyzing chart with military-grade algorithms..."):
         # Extract candlesticks
@@ -471,69 +915,206 @@ if uploaded_file:
             predictions = predictor.predict_next_candles(df, num_predictions)
             
             if predictions:
-                # Display predictions
-                st.markdown("### 🎯 Predicted Next Candles")
-                
-                pred_df = pd.DataFrame(predictions)
-                pred_df.index = [f"Candle +{i+1}" for i in range(len(pred_df))]
-                
-                display_df = pred_df[['open', 'high', 'low', 'close']].round(4)
-                st.dataframe(display_df, use_container_width=True)
-                
-                # Plot
-                fig = plot_predictions(df, predictions)
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Statistics
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    price_change = pred_df['close'].iloc[-1] - df['close'].iloc[-1]
-                    st.metric("Predicted Change", f"{price_change:.4f}", 
-                             f"{(price_change/df['close'].iloc[-1]*100):.2f}%")
-                
-                with col2:
-                    st.metric("Predicted High", f"{pred_df['high'].max():.4f}")
-                
-                with col3:
-                    st.metric("Predicted Low", f"{pred_df['low'].min():.4f}")
-                
-                with col4:
-                    trend = "📈 BULLISH" if pred_df['close'].iloc[-1] > df['close'].iloc[-1] else "📉 BEARISH"
-                    st.metric("Trend", trend)
-                
-                # Technical Analysis
-                st.markdown("### 📊 Technical Analysis")
+                # Calculate features for analysis
                 features = predictor.calculate_features(df)
                 
-                col1, col2, col3 = st.columns(3)
+                # Calculate metrics (use last N candles for comparison)
+                recent_actual = df['close'].tail(num_predictions).values
+                recent_predicted = pd.DataFrame(predictions)['close'].values
+                metrics = PerformanceMetrics.calculate_metrics(recent_actual, recent_predicted)
                 
-                with col1:
-                    rsi = features['rsi'].iloc[-1]
-                    rsi_status = "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral"
-                    st.metric("RSI", f"{rsi:.2f}", rsi_status)
+                # Run backtest
+                backtest_results = run_backtest(df, predictions)
                 
-                with col2:
-                    volatility = features['volatility'].iloc[-1]
-                    st.metric("Volatility", f"{volatility:.4f}")
+                # Create tabs for comprehensive dashboard
+                tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+                    "📈 Predictions", "📊 Performance", "🎯 Backtest", 
+                    "📉 Analysis", "🔍 Explainability", "📥 Export"
+                ])
                 
-                with col3:
-                    volume_ratio = features['volume_ratio'].iloc[-1]
-                    st.metric("Volume Ratio", f"{volume_ratio:.2f}")
-
-                # Build overlay with analysis on the uploaded image
-                analysis_lines = [
-                    f"Detected candles: {len(candlesticks)}",
-                    f"Pred horizon: {len(pred_df)}",
-                    f"RSI: {rsi:.2f} ({rsi_status})",
-                    f"Volatility: {volatility:.4f}",
-                    f"Volume Ratio: {volume_ratio:.2f}",
-                    f"Trend: {trend}",
-                ]
-                overlay_img = create_overlay_image(img_array, candlesticks, analysis_lines)
-
-                st.markdown("### 🖼️ Visual Analysis Overlay")
-                st.image(overlay_img, caption="Detected candlesticks and analysis overlay", use_container_width=True)
+                with tab1:
+                    st.image(image, caption="Uploaded Chart", use_container_width=True)
+                    
+                    # Main candlestick chart with predictions
+                    fig = plot_predictions(df, predictions)
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    st.markdown("### 🎯 Predicted Next Candles")
+                    pred_df = pd.DataFrame(predictions)
+                    pred_df.index = [f"Candle +{i+1}" for i in range(len(pred_df))]
+                    
+                    display_df = pred_df[['open', 'high', 'low', 'close', 'volume']].round(4)
+                    st.dataframe(display_df, use_container_width=True)
+                    
+                    # Summary metrics
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        price_change = pred_df['close'].iloc[-1] - df['close'].iloc[-1]
+                        st.metric("Predicted Change", f"{price_change:.4f}", 
+                                 f"{(price_change/df['close'].iloc[-1]*100):.2f}%")
+                    
+                    with col2:
+                        st.metric("Predicted High", f"{pred_df['high'].max():.4f}")
+                    
+                    with col3:
+                        st.metric("Predicted Low", f"{pred_df['low'].min():.4f}")
+                    
+                    with col4:
+                        trend = "📈 BULLISH" if pred_df['close'].iloc[-1] > df['close'].iloc[-1] else "📉 BEARISH"
+                        st.metric("Trend", trend)
+                
+                with tab2:
+                    st.markdown("### 📊 Model Performance Metrics")
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("MAE", f"{metrics.get('mae', 0):.4f}")
+                    with col2:
+                        st.metric("RMSE", f"{metrics.get('rmse', 0):.4f}")
+                    with col3:
+                        st.metric("MAPE", f"{metrics.get('mape', 0):.2f}%")
+                    with col4:
+                        st.metric("R² Score", f"{metrics.get('r2', 0):.4f}")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Directional Accuracy", f"{metrics.get('directional_accuracy', 0):.2f}%")
+                    with col2:
+                        st.metric("Residual Mean", f"{metrics.get('residual_mean', 0):.6f}")
+                    
+                    # Model Info
+                    st.markdown("### 🤖 Model Information")
+                    model_info = predictor.get_model_info()
+                    
+                    info_col1, info_col2 = st.columns(2)
+                    with info_col1:
+                        st.write(f"**Model Name:** {model_info['name']}")
+                        st.write(f"**Version:** {model_info['version']}")
+                        st.write(f"**Training Date:** {model_info['training_date']}")
+                        st.write(f"**Feature Count:** {model_info['feature_count']}")
+                    
+                    with info_col2:
+                        st.write(f"**N Estimators:** {model_info['hyperparameters']['n_estimators']}")
+                        st.write(f"**Max Depth:** {model_info['hyperparameters']['max_depth']}")
+                        st.write(f"**Learning Rate:** {model_info['hyperparameters']['learning_rate']}")
+                    
+                    # Visualization charts
+                    st.markdown("### 📈 Prediction vs Actual")
+                    fig_vs = plot_prediction_vs_actual(df, predictions)
+                    if fig_vs:
+                        st.plotly_chart(fig_vs, use_container_width=True)
+                
+                with tab3:
+                    st.markdown("### 💰 Backtest Results")
+                    
+                    if backtest_results:
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Total Return", f"{backtest_results.get('total_return_pct', 0):.2f}%")
+                        with col2:
+                            st.metric("Sharpe Ratio", f"{backtest_results.get('sharpe_ratio', 0):.2f}")
+                        with col3:
+                            st.metric("Max Drawdown", f"{backtest_results.get('max_drawdown_pct', 0):.2f}%")
+                        with col4:
+                            st.metric("Win Rate", f"{backtest_results.get('win_rate', 0):.2f}%")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Total Trades", backtest_results.get('total_trades', 0))
+                        with col2:
+                            st.metric("Avg Win/Loss", f"{backtest_results.get('avg_win', 0):.4f} / {backtest_results.get('avg_loss', 0):.4f}")
+                        
+                        # Equity curve and drawdown
+                        fig_backtest = plot_backtest_results(backtest_results)
+                        if fig_backtest:
+                            st.plotly_chart(fig_backtest, use_container_width=True)
+                
+                with tab4:
+                    st.markdown("### 📉 Analysis Charts")
+                    
+                    # Residual analysis
+                    st.markdown("#### Residual Analysis")
+                    fig_residuals = plot_residuals(df, predictions)
+                    if fig_residuals:
+                        st.plotly_chart(fig_residuals, use_container_width=True)
+                    
+                    # Correlation heatmap
+                    st.markdown("#### Feature Correlation")
+                    fig_corr = plot_correlation_heatmap(df)
+                    if fig_corr:
+                        st.plotly_chart(fig_corr, use_container_width=True)
+                
+                with tab5:
+                    st.markdown("### 🔍 Model Explainability")
+                    
+                    # Feature importance
+                    st.markdown("#### Top Feature Importances")
+                    fig_importance = plot_feature_importance(predictor)
+                    if fig_importance:
+                        st.plotly_chart(fig_importance, use_container_width=True)
+                    
+                    # Technical indicators
+                    st.markdown("#### Technical Indicators")
+                    features_calc = predictor.calculate_features(df)
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        rsi = features_calc['rsi'].iloc[-1]
+                        rsi_status = "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral"
+                        st.metric("RSI", f"{rsi:.2f}", rsi_status)
+                    
+                    with col2:
+                        volatility = features_calc['volatility'].iloc[-1]
+                        st.metric("Volatility", f"{volatility:.4f}")
+                    
+                    with col3:
+                        volume_ratio = features_calc['volume_ratio'].iloc[-1]
+                        st.metric("Volume Ratio", f"{volume_ratio:.2f}")
+                
+                with tab6:
+                    st.markdown("### 📥 Export Data")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        csv_data = export_predictions_csv(predictions)
+                        st.download_button(
+                            label="📄 Download Predictions (CSV)",
+                            data=csv_data,
+                            file_name=f"predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv"
+                        )
+                    
+                    with col2:
+                        json_data = export_predictions_json(predictions)
+                        st.download_button(
+                            label="📄 Download Predictions (JSON)",
+                            data=json_data,
+                            file_name=f"predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                            mime="application/json"
+                        )
+                    
+                    with col3:
+                        report_data = export_model_report(predictor, metrics, backtest_results)
+                        st.download_button(
+                            label="📊 Download Report (TXT)",
+                            data=report_data,
+                            file_name=f"model_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                            mime="text/plain"
+                        )
+                    
+                    # Overlay visualization
+                    st.markdown("### 🖼️ Visual Analysis Overlay")
+                    analysis_lines = [
+                        f"Detected candles: {len(candlesticks)}",
+                        f"Pred horizon: {len(pred_df)}",
+                        f"MAE: {metrics.get('mae', 0):.4f}",
+                        f"RMSE: {metrics.get('rmse', 0):.4f}",
+                        f"R²: {metrics.get('r2', 0):.4f}",
+                    ]
+                    overlay_img = create_overlay_image(img_array, candlesticks, analysis_lines)
+                    st.image(overlay_img, caption="Detected candlesticks and analysis overlay", use_container_width=True)
 
 else:
     st.info("👆 Upload a price chart image to begin analysis")
